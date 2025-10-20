@@ -1,0 +1,417 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+#define FALSE 0u
+#define TRUE 1u
+
+//Math functions
+#define MAX(a,b) ((a)>(b) ? (a):(b))
+#define MIN(a,b) ((a)<(b) ? (a):(b))
+
+//Misc hard values
+#define TASK_TIME_100MS 100u        //100ms task time
+#define TASK_TIME_90MS_WARNING 90u  //The threshold to trigger an alarm for high task time.
+#define TEN_SECOND_TIMER 10000u     //10 seconds in milliseconds.
+#define CIRCULAR_BUFFER_SIZE 50u    //I am assuming that 50 data points (5 seconds of data) will be adequate for PID control.
+#define MAX_RPM_COOLANT_PUMP 40000u //40krpm example value.
+#define IDEAL_TEMP_SETPOINT 60.0f   //Assumed ideal temp setpoint
+
+//Temperature control gains
+#define TEMPERATURE_CONTROL_PTERM 1.0f
+#define TEMPERATURE_CONTROL_ITERM 2.5f
+#define TEMPERATURE_CONTROL_DTERM 4.6f
+
+//Valid system states within state machine
+enum possibleStates {
+    plcBootState,
+    plcStartupState,
+    plcRunningState,
+    plcErrorState
+};
+
+//Alarm list
+enum alarmList {
+    clockFailure,
+    taskTimeExceeded,
+    stateMachineOutOfBounds,
+    coolantPumpCurrentLow,
+    inverterOvertemperature,
+    DCDCOvertemperature
+};
+
+enum alarmSeverity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
+};
+
+//Circular Buffer setup
+typedef struct {
+    uint8_t writeLocation;
+    uint8_t readLocation;
+    float dataPayload[CIRCULAR_BUFFER_SIZE];
+} circularBuffer;
+
+//Circular buffer functions
+static void writeToBuffer(float inputWrite, circularBuffer* const inputBuffer);
+static uint8_t readFromBuffer(circularBuffer* const inputBuffer);
+
+//PID control setup
+typedef struct {
+    float ProportionalGain;
+    float IntegralGain;
+    float DerivativeGain;
+} PIDcontrolGains;
+                    
+
+//Alarm structure 
+typedef struct {
+    uint8_t presentAlarm; //Flag present alarm 
+    uint8_t alarmSeverityLevel; //determine severity to plan how the system should respond.
+} alarmStruct;
+
+//Global Variables/structures
+static uint8_t presentState_u8 = 0u;
+static bool presentAlarmTrigger = FALSE;
+static alarmStruct alarmPresent;
+static float temperatureFeedback = 0.0f; //Thermister feedback (Temperature sensor value)
+
+
+//State machine functions
+static void stateMachine(uint64_t presentTimeMilli_u64);
+static void coolantPumpControl();
+static void inputHardwareTracker();
+static void radiatorFanControl();
+
+//PID functions
+static float controllerPID(float plantSetpoint, 
+                    float plantFeedback, 
+                    circularBuffer errorTermRecord,
+                    PIDcontrolGains PIDsetGains, 
+                    uint8_t includeAntiIntegralWindup);
+                    
+static float IntegralControl(const circularBuffer* const errorTermRecord, 
+                    float IntegralGainTerm, 
+                    uint8_t includeAntiIntegralWindup);
+                    
+static float DerivativeControl(const circularBuffer* const errorTermRecord,
+                    float DerivativeGainTerm);
+
+
+
+int main(void){
+    // I am making the assumption that we have a hardware clock that we can read present time from (in milliseconds).
+    // This value is specified to be volitile to warn the compiler that the most up to date measurement should be read from the pointer,
+    // (warn it not to use previously cached values).
+    volatile uint64_t hardwareClockMC_u64 = 0u;
+    uint64_t presentTimeMilli_u64 = 0u; //compare this value later to determine when 100ms has passed.
+    uint64_t exitTimeMilli_u64 = 0u;
+    
+    
+    //I used an infinite loop to simulate a real time system. please feel free to comment out While(1){ to prevent timeout errors if running in VScode.
+    while(1) {
+        
+        //creating a 100ms task time loop.
+        if (hardwareClockMC_u64 - presentTimeMilli_u64 > TASK_TIME_100MS) {
+            
+            //Task 0: Update present time to hardware clock value.
+            presentTimeMilli_u64 = hardwareClockMC_u64;
+            
+            //Task 1: State machine
+            stateMachine(presentTimeMilli_u64);
+            
+            //task 2: Read inputs into system (I.E CAN)
+            inputHardwareTracker();
+            
+            //Task 3: Coolant pump control (PID control)
+            coolantPumpControl();
+            
+            //Task 4: Radiator fan control  (Bang Bang control)
+            radiatorFanControl();
+            
+            //Task 5: Verify that task time is not reaching/nearing the 100ms maximum
+            if(hardwareClockMC_u64 - presentTimeMilli_u64 > TASK_TIME_90MS_WARNING) {
+                alarmPresent.presentAlarm = taskTimeExceeded;
+                alarmPresent.alarmSeverityLevel = HIGH;
+                presentAlarmTrigger = TRUE;
+            }
+        }
+        
+        //checking hardware clock for validity
+        if(hardwareClockMC_u64 < presentTimeMilli_u64) {
+            //The hardware clock should always be larger than the present time measurement, which copies its value later.
+            //This is indicative that there is a hardware error with the clock. I know this is not an overflow because a u64 variable would
+            //require 500 million years to overflow, if it was counting milliseconds.
+            alarmPresent.presentAlarm = clockFailure;
+            alarmPresent.alarmSeverityLevel = CRITICAL;
+            presentAlarmTrigger = TRUE;
+        }
+    }
+}
+
+
+static void stateMachine(uint64_t presentTimeMilli_u64) {
+    
+    //set to 0/boot state by default. Retain its value between function calls to update state machine.
+    static uint8_t nextState_u8 = plcBootState; 
+    static bool startupFlag = FALSE;
+    static uint64_t startupTimer_u64 = 0u;
+    
+    //Update present state based on previous iteration
+    if (nextState_u8 != presentState_u8) {
+        presentState_u8 = nextState_u8;
+    }
+    
+    //System State machine
+    switch (presentState_u8) {
+        
+        //MCU has switched on, move to startup.
+        case plcBootState:
+            
+            nextState_u8 = plcStartupState;
+            startupFlag = TRUE;
+            
+        break;
+        
+        //Check BOP (Breath Of Plant) components for relevant alarms prior to running.
+        case plcStartupState:
+            
+            //If there has been no errors reported for 10 seconds, move on to running state.
+            if(startupFlag == TRUE) {
+                startupFlag = FALSE;
+                startupTimer_u64 = presentTimeMilli_u64;
+            } 
+            
+            if(presentTimeMilli_u64 - startupTimer_u64 > TEN_SECOND_TIMER) {
+                nextState_u8 = plcRunningState;
+            }
+            
+        break;
+        
+        //Control the coolant pump and the radiator fan to reach a predetermined temperature setpoint.
+        case plcRunningState:
+            //The system can remain in this state indefinatley until the next power cycle, or an alarm is triggered.
+        break;
+        
+        //Turn off all systems. Mitigate hardware damage where possible.
+        case plcErrorState:
+            //There should be no exit to this state until the system has been power cycled and the problem addressed.
+        break;
+        
+        default:
+            //The state machine should never end up here. Flag a software alarm if it does.
+            alarmPresent.presentAlarm = stateMachineOutOfBounds;
+            alarmPresent.alarmSeverityLevel = CRITICAL;
+            presentAlarmTrigger = TRUE;
+            
+        
+    }
+    
+    //If any alarms are present, immediatly proceed to error state
+    if (presentAlarmTrigger == TRUE) {
+        nextState_u8 = plcErrorState;
+    }
+    
+}
+
+static void inputHardwareTracker() {
+    //Assuming we have an input CAN frames. 
+    //(I am assuming that this is the datapayload, and that the CRC (cyclical redundacy check) and ACK (acknowledgment) have already been checked.)
+    uint64_t inputCoolantPumpCANframe = 0u;
+    
+    /*
+    It is worth mentioning here that each BOP component has relevant alarms that 
+    they are capable of reporting, which spotlight issues that are internal to the component.
+    - Some common errors: over/under voltage, over/under current, overtemperature, software error, CAN communication timeout.
+    
+    For example, lets assume we have a boolean bit on the 5th bit (0-7) of the input coolant pump CAN frame that
+    denotes a high temperature warning, (This is info that we would learn directly from the suppliers datasheet).
+    We can access this info with a bit mask and trigger an alarm within the MCU if appropriate. */
+    if( inputCoolantPumpCANframe && 0b0100000 > 0u) {
+        alarmPresent.presentAlarm = coolantPumpCurrentLow;
+        alarmPresent.alarmSeverityLevel = MEDIUM;
+        presentAlarmTrigger = TRUE;
+    }
+    
+    
+    
+}
+
+static void radiatorFanControl() {
+    
+    //simple Bang bang control
+    bool fanOnCommand = FALSE;
+    const bool fanRequired = (IDEAL_TEMP_SETPOINT - temperatureFeedback) > 5;
+    
+    //if we are in running state and not within 5 degrees of the desired temperature,
+    //then turn on the fan to dissipate heat from coolant loop.
+    if (presentState_u8 == plcRunningState && fanRequired) {
+        fanOnCommand = TRUE;
+    } 
+    
+}
+
+static void coolantPumpControl() {
+    
+    float coolantPumpRPMsetpoint = 0.0f;
+    float temperatureSetpoint = IDEAL_TEMP_SETPOINT; //60 Celsius. Assumed ideal temperature setpoint, provided by user.
+    //float temperatureFeedback = 0.0f; //assumed that this is a raw thermistor value interpreted from temperature sensor.
+    circularBuffer TemperatureBuffer; 
+    
+    //PID gains. (I provided some example values, but if this was a real system, these would need to be tuned/modelled)
+    PIDcontrolGains ExamplePIDset = {TEMPERATURE_CONTROL_PTERM, TEMPERATURE_CONTROL_ITERM, TEMPERATURE_CONTROL_DTERM};
+    
+    //Initialize relevant structures
+    static bool startupCoolantFlag = TRUE;
+    
+    if(startupCoolantFlag == TRUE) {
+        //Only initilize the following once
+        startupCoolantFlag = FALSE;
+        
+        //Initialize PID control (and associated circular buffer) to later be used in running state.
+        TemperatureBuffer.writeLocation = 0;
+        TemperatureBuffer.readLocation = 0;
+        memset(TemperatureBuffer.dataPayload, 0, CIRCULAR_BUFFER_SIZE*sizeof(uint8_t));
+    }
+    
+    //Coolant Pump State Machine - Based on system states.
+    switch (presentState_u8) {
+        
+        case plcBootState:
+        case plcStartupState:
+            
+            //Specify the coolant pump rpm to be 0, in the event that there was a previous failure tha involved coolant escaping the coolant loop.
+            coolantPumpRPMsetpoint = 0u;
+            
+        break;
+        
+        case plcRunningState:
+        
+            //PID control to meet specific RPM required.
+            coolantPumpRPMsetpoint = controllerPID(temperatureSetpoint, 
+                                                   temperatureFeedback, 
+                                                   TemperatureBuffer, 
+                                                   ExamplePIDset, 
+                                                   FALSE);
+                                                   
+            //Prevent the PID control from commanding the rpm out of bounds of what the coolant pump can physically reach. (0 to MAX_RPM)
+            coolantPumpRPMsetpoint = MAX(0u, MIN(coolantPumpRPMsetpoint, MAX_RPM_COOLANT_PUMP));
+        
+        break;
+        
+        case plcErrorState:
+        
+            //Depending on alarm, might need to command rpm to remain high during error state.
+            if (alarmPresent.presentAlarm == inverterOvertemperature || alarmPresent.presentAlarm == DCDCOvertemperature)
+                //Force the coolant pump rpm to remain high while we shutdown DCDC and inverter to mitigate hardware damage.
+                coolantPumpRPMsetpoint = MAX_RPM_COOLANT_PUMP;
+            else {
+                //turn off coolant pump
+                coolantPumpRPMsetpoint = 0u;
+            }
+        
+        break;
+        
+        default:
+            //The state machine should never end up here. Flag a software alarm if it does.
+            alarmPresent.presentAlarm = stateMachineOutOfBounds;
+            alarmPresent.alarmSeverityLevel = CRITICAL;
+            presentAlarmTrigger = TRUE;
+    }
+}
+
+static float controllerPID(const float plantSetpoint, const float plantFeedback, circularBuffer errorTermRecord, PIDcontrolGains PIDsetGains, uint8_t includeAntiIntegralWindup) {
+    
+    //tracking present and previous error in circular buffer
+    const float presentError = (plantSetpoint - plantFeedback);
+    writeToBuffer(presentError, &errorTermRecord);
+    //printf("\n present error: %f", presentError);
+    
+    //Proportional control
+    const float PtermControlSignal = PIDsetGains.ProportionalGain * presentError;
+    
+    //Integral control
+    const float ItermControlSignal = IntegralControl(&errorTermRecord, PIDsetGains.IntegralGain, includeAntiIntegralWindup);
+    
+    //Derivative control
+    const float DtermControlSignal = DerivativeControl(&errorTermRecord, PIDsetGains.DerivativeGain);
+    
+    //Sum control terms for final plant input signal
+    const float SumControlSignal = PtermControlSignal + ItermControlSignal + DtermControlSignal;
+    
+    return SumControlSignal;
+}
+
+
+static float IntegralControl(const circularBuffer* const errorTermRecord, float IntegralGainTerm, uint8_t includeAntiIntegralWindup) {
+    float SummedIError = 0.0f;
+    
+    for( int IntegralIndex = 0u; IntegralIndex < CIRCULAR_BUFFER_SIZE; IntegralIndex++){
+        
+        //If anti integral windup has been selected, only include integral error since the last time the errorterm crossed the 0 threshold.
+        if (includeAntiIntegralWindup == TRUE && IntegralIndex != 0) {
+            
+            //Ierror[IntegralIndex]*Ierror[IntegralIndex-1] will only be less than 0 if the 0 threshold was crossed sometime between IntegralIndex and IntegralIndex-1;
+            if( ((errorTermRecord->dataPayload[IntegralIndex])*(errorTermRecord->dataPayload[IntegralIndex-1u]) <= 0u) && (IntegralIndex > 0u)) {
+                //Cease the sum, only use the summed error up until this point.
+                break;
+            }
+        }
+        
+        SummedIError += errorTermRecord->dataPayload[IntegralIndex];
+        //printf("\ncounting: %f", errorTermRecord->dataPayload[IntegralIndex]);
+    }
+    
+    return (IntegralGainTerm * SummedIError);
+}
+
+
+static float DerivativeControl(const circularBuffer* const errorTermRecord, float DerivativeGainTerm) {
+    float DError = 0.0f;
+    
+    if (CIRCULAR_BUFFER_SIZE == 0) {
+        //Set D term control to 0, if the array size of 0 is passed, to prevent div by 0.
+        return 0.0f;
+    } else {
+        //determine rate of change of present error versus oldest error in array
+        DError = (errorTermRecord->dataPayload[errorTermRecord->readLocation] - (errorTermRecord->dataPayload[errorTermRecord->writeLocation]))/CIRCULAR_BUFFER_SIZE;
+        
+        return (DerivativeGainTerm * DError);
+    }
+}
+
+static void writeToBuffer(const float inputWrite, circularBuffer* const inputBuffer){
+
+    // increment write location. Wrap write location around to 0 if we exceed the CIRCULAR_BUFFER_SIZE
+    inputBuffer->writeLocation = (inputBuffer->writeLocation + 1u) % CIRCULAR_BUFFER_SIZE;
+    
+    //If the write pointer has wrapped around and reached the read pointer, push the read pointer forward by 1.
+    if(inputBuffer->writeLocation == inputBuffer->readLocation) {
+        inputBuffer->readLocation = (inputBuffer->readLocation + 1u) % CIRCULAR_BUFFER_SIZE;
+    }
+    
+    //write to buffer
+    inputBuffer->dataPayload[inputBuffer->writeLocation] = inputWrite;
+
+}
+
+static uint8_t readFromBuffer(circularBuffer* const inputBuffer){
+
+     //Increment read position. Wrap write location around to 0 if we exceed the CIRCULAR_BUFFER_SIZE
+    inputBuffer->readLocation = (inputBuffer->readLocation + 1u) % CIRCULAR_BUFFER_SIZE;
+    
+    //If read position has caught up to write position after lapping it. Prevent it from going further to keep the read/write pointers in sync.
+    if(inputBuffer->readLocation == inputBuffer->writeLocation) {
+        inputBuffer->readLocation = (inputBuffer->readLocation - 1u) % CIRCULAR_BUFFER_SIZE;
+    }
+
+    //retrieve present read value
+    uint8_t presentReadValue = inputBuffer->dataPayload[inputBuffer->readLocation];
+
+    return presentReadValue;
+}
+
+
